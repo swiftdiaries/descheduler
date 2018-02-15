@@ -19,6 +19,8 @@ package descheduler
 import (
 	"fmt"
 
+	"github.com/golang/glog"
+
 	"github.com/kubernetes-incubator/descheduler/cmd/descheduler/app/options"
 	"github.com/kubernetes-incubator/descheduler/pkg/descheduler/client"
 	eutils "github.com/kubernetes-incubator/descheduler/pkg/descheduler/evictions/utils"
@@ -39,22 +41,28 @@ func Run(rs *options.DeschedulerServer) error {
 		return err
 	}
 	if deschedulerPolicy == nil {
-		return fmt.Errorf("\ndeschedulerPolicy is nil\n")
-
+		return fmt.Errorf("deschedulerPolicy is nil")
 	}
+
 	evictionPolicyGroupVersion, err := eutils.SupportEviction(rs.Client)
 	if err != nil || len(evictionPolicyGroupVersion) == 0 {
 		return err
 	}
 
 	stopChannel := make(chan struct{})
-	nodes, err := nodeutil.ReadyNodes(rs.Client, stopChannel)
+	nodes, err := nodeutil.ReadyNodes(rs.Client, rs.NodeSelector, stopChannel)
 	if err != nil {
 		return err
 	}
 
-	strategies.RemoveDuplicatePods(rs.Client, deschedulerPolicy.Strategies["RemoveDuplicates"], evictionPolicyGroupVersion, nodes)
-	strategies.LowNodeUtilization(rs.Client, deschedulerPolicy.Strategies["LowNodeUtilization"], evictionPolicyGroupVersion, nodes)
+	if len(nodes) <= 1 {
+		glog.V(1).Infof("The cluster size is 0 or 1 meaning eviction causes service disruption or degradation. So aborting..")
+		return nil
+	}
+
+	strategies.RemoveDuplicatePods(rs, deschedulerPolicy.Strategies["RemoveDuplicates"], evictionPolicyGroupVersion, nodes)
+	strategies.LowNodeUtilization(rs, deschedulerPolicy.Strategies["LowNodeUtilization"], evictionPolicyGroupVersion, nodes)
+	strategies.RemovePodsViolatingInterPodAntiAffinity(rs, deschedulerPolicy.Strategies["RemovePodsViolatingInterPodAntiAffinity"], evictionPolicyGroupVersion, nodes)
 
 	return nil
 }

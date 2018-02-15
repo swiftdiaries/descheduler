@@ -19,16 +19,19 @@ package evictions
 import (
 	"fmt"
 
+	"k8s.io/api/core/v1"
+	policy "k8s.io/api/policy/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/kubernetes/pkg/api/v1"
-	policy "k8s.io/kubernetes/pkg/apis/policy/v1beta1"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
+	clientset "k8s.io/client-go/kubernetes"
 
 	eutils "github.com/kubernetes-incubator/descheduler/pkg/descheduler/evictions/utils"
 )
 
-func EvictPod(client clientset.Interface, pod *v1.Pod, policyGroupVersion string) (bool, error) {
+func EvictPod(client clientset.Interface, pod *v1.Pod, policyGroupVersion string, dryRun bool) (bool, error) {
+	if dryRun {
+		return true, nil
+	}
 	deleteOptions := &metav1.DeleteOptions{}
 	// GracePeriodSeconds ?
 	eviction := &policy.Eviction{

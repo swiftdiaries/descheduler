@@ -1,3 +1,6 @@
+[![Build Status](https://travis-ci.org/kubernetes-incubator/descheduler.svg?branch=master)](https://travis-ci.org/kubernetes-incubator/descheduler)
+[![Go Report Card](https://goreportcard.com/badge/github.com/kubernetes-incubator/descheduler)](https://goreportcard.com/report/github.com/kubernetes-incubator/descheduler)
+
 # Descheduler for Kubernetes
 
 ## Introduction
@@ -40,10 +43,116 @@ For more information about available options run:
 $ ./_output/bin/descheduler --help
 ```
 
+## Running Descheduler as a Job Inside of a Pod
+
+Descheduler can be run as a job inside of a pod. It has the advantage of
+being able to be run multiple times without needing user intervention.
+Descheduler pod is run as a critical pod to avoid being evicted by itself,
+or by kubelet due to an eviction event. Since critical pods are created in
+`kube-system` namespace, descheduler job and its pod will also be created
+in `kube-system` namespace.
+
+###  Create a container image
+
+First we create a simple Docker image utilizing the Dockerfile found in the root directory:
+
+```
+$ make image
+```
+
+### Create a cluster role
+
+To give necessary permissions for the descheduler to work in a pod, create a cluster role:
+
+```
+$ cat << EOF| kubectl create -f -
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: descheduler-cluster-role
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "watch", "list", "delete"]
+- apiGroups: [""]
+  resources: ["pods/eviction"]
+  verbs: ["create"]
+EOF
+```
+
+### Create the service account which will be used to run the job:
+
+```
+$ kubectl create sa descheduler-sa -n kube-system
+```
+
+### Bind the cluster role to the service account:
+
+```
+$ kubectl create clusterrolebinding descheduler-cluster-role-binding \
+    --clusterrole=descheduler-cluster-role \
+    --serviceaccount=kube-system:descheduler-sa
+```
+### Create a configmap to store descheduler policy
+
+Descheduler policy is created as a ConfigMap in `kube-system` namespace
+so that it can be mounted as a volume inside pod.
+
+```
+$ kubectl create configmap descheduler-policy-configmap \
+     -n kube-system --from-file=<path-to-policy-dir/policy.yaml>
+```
+### Create the job specification (descheduler-job.yaml)
+
+```
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: descheduler-job
+  namespace: kube-system
+spec:
+  parallelism: 1
+  completions: 1
+  template:
+    metadata:
+      name: descheduler-pod
+      annotations:
+        scheduler.alpha.kubernetes.io/critical-pod: "true"
+    spec:
+        containers:
+        - name: descheduler
+          image: descheduler
+          volumeMounts:
+          - mountPath: /policy-dir
+            name: policy-volume
+          command:
+          - "/bin/sh"
+          - "-ec"
+          - |
+            /bin/descheduler --policy-config-file /policy-dir/policy.yaml
+        restartPolicy: "Never"
+        serviceAccountName: descheduler-sa
+        volumes:
+        - name: policy-volume
+          configMap:
+            name: descheduler-policy-configmap
+```
+
+Please note that the pod template is configured with critical pod annotation, and
+the policy `policy-file` is mounted as a volume from the config map.
+
+### Run the descheduler as a job in a pod:
+```
+$ kubectl create -f descheduler-job.yaml
+```
+
 ## Policy and Strategies
  
 Descheduler's policy is configurable and includes strategies to be enabled or disabled.
-Two strategies, `RemoveDuplicates` and `LowNodeUtilization` are currently implemented.
+Three strategies, `RemoveDuplicates`, `LowNodeUtilization`, `RemovePodsViolatingInterPodAntiAffinity` are currently implemented.
 As part of the policy, the parameters associated with the strategies can be configured too.
 By default, all strategies are enabled.
 
@@ -55,7 +164,7 @@ those duplicate pods are evicted for better spreading of pods in a cluster. This
 if some nodes went down due to whatever reasons, and pods on them were moved to other nodes leading to
 more than one pod associated with RS or RC, for example, running on same node. Once the failed nodes
 are ready again, this strategy could be enabled to evict those duplicate pods. Currently, there are no
-parameters associated with this strategy. To disable this strategy, the policy would look like:
+parameters associated with this strategy. To disable this strategy, the policy should look like:
 
 ```
 apiVersion: "descheduler/v1alpha1"
@@ -107,6 +216,18 @@ This parameter can be configured to activate the strategy only when number of un
 are above the configured value. This could be helpful in large clusters where a few nodes could go
 under utilized frequently or for a short period of time. By default, `numberOfNodes` is set to zero.
 
+### RemovePodsViolatingInterPodAntiAffinity
+
+This strategy makes sure that pods violating interpod anti-affinity are removed from nodes. For example, if there is podA on node and podB and podC(running on same node) have antiaffinity rules which prohibit them to run on the same node, then podA will be evicted from the node so that podB and podC could run. This issue could happen, when the anti-affinity rules for pods B,C are created when they are already running on node. Currently, there are no parameters associated with this strategy. To disable this strategy, the policy should look like:
+
+```
+apiVersion: "descheduler/v1alpha1"
+kind: "DeschedulerPolicy"
+strategies:
+  "RemovePodsViolatingInterPodAntiAffinity":
+     enabled: false
+```
+
 ## Pod Evictions
 
 When the descheduler decides to evict pods from a node, it employs following general mechanism:
@@ -126,16 +247,21 @@ disruption budget (PDB). The pods are evicted by using eviction subresource to h
 
 This roadmap is not in any particular order.
 
-* Addition of test cases (unit and end-to-end)
-* Ability to run inside a pod as a job
 * Strategy to consider taints and tolerations
-* Consideration of pod affinity and anti-affinity
+* Consideration of pod affinity 
 * Strategy to consider pod life time
 * Strategy to consider number of pending pods
 * Integration with cluster autoscaler
 * Integration with metrics providers for obtaining real load metrics
 * Consideration of Kubernetes's scheduler's predicates
 
+
+## Compatibility matrix
+
+Descheduler  | supported Kubernetes version
+-------------|-----------------------------
+0.4          | 1.9+
+0.1-0.3      | 1.7-1.8
 
 ## Note
 

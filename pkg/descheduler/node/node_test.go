@@ -17,18 +17,14 @@ limitations under the License.
 package node
 
 import (
-	"fmt"
 	"testing"
 
 	"github.com/kubernetes-incubator/descheduler/test"
-	"k8s.io/apimachinery/pkg/runtime"
-	core "k8s.io/client-go/testing"
-	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/clientset/fake"
+	"k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 func TestReadyNodes(t *testing.T) {
-	fakeClient := &fake.Clientset{}
 	node1 := test.BuildTestNode("node1", 1000, 2000, 9)
 	node1.Status.Conditions = []v1.NodeCondition{{Type: v1.NodeOutOfDisk, Status: v1.ConditionTrue}}
 	node2 := test.BuildTestNode("node2", 1000, 2000, 9)
@@ -40,25 +36,6 @@ func TestReadyNodes(t *testing.T) {
 	node5.Spec.Unschedulable = true
 	node6 := test.BuildTestNode("node6", 1000, 2000, 9)
 	node6.Status.Conditions = []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionFalse}}
-
-	fakeClient.Fake.AddReactor("get", "nodes", func(action core.Action) (bool, runtime.Object, error) {
-		getAction := action.(core.GetAction)
-		switch getAction.GetName() {
-		case node1.Name:
-			return true, node1, nil
-		case node2.Name:
-			return true, node2, nil
-		case node3.Name:
-			return true, node3, nil
-		case node4.Name:
-			return true, node4, nil
-		case node5.Name:
-			return true, node5, nil
-		case node6.Name:
-			return true, node6, nil
-		}
-		return true, nil, fmt.Errorf("Wrong node: %v", getAction.GetName())
-	})
 
 	if !IsReady(node1) {
 		t.Errorf("Expected %v to be ready", node1.Name)
@@ -77,6 +54,51 @@ func TestReadyNodes(t *testing.T) {
 	}
 	if IsReady(node6) {
 		t.Errorf("Expected %v to be not ready", node6.Name)
+	}
+
+}
+
+func TestReadyNodesWithNodeSelector(t *testing.T) {
+	node1 := test.BuildTestNode("node1", 1000, 2000, 9)
+	node1.Labels = map[string]string{"type": "compute"}
+	node2 := test.BuildTestNode("node2", 1000, 2000, 9)
+	node2.Labels = map[string]string{"type": "infra"}
+
+	fakeClient := fake.NewSimpleClientset(node1, node2)
+	nodeSelector := "type=compute"
+	nodes, _ := ReadyNodes(fakeClient, nodeSelector, nil)
+
+	if nodes[0].Name != "node1" {
+		t.Errorf("Expected node1, got %s", nodes[0].Name)
+	}
+}
+
+func TestIsNodeUschedulable(t *testing.T) {
+	tests := []struct {
+		description     string
+		node            *v1.Node
+		IsUnSchedulable bool
+	}{
+		{
+			description: "Node is expected to be schedulable",
+			node: &v1.Node{
+				Spec: v1.NodeSpec{Unschedulable: false},
+			},
+			IsUnSchedulable: false,
+		},
+		{
+			description: "Node is not expected to be schedulable because of unschedulable field",
+			node: &v1.Node{
+				Spec: v1.NodeSpec{Unschedulable: true},
+			},
+			IsUnSchedulable: true,
+		},
+	}
+	for _, test := range tests {
+		actualUnSchedulable := IsNodeUschedulable(test.node)
+		if actualUnSchedulable != test.IsUnSchedulable {
+			t.Errorf("Test %#v failed", test.description)
+		}
 	}
 
 }

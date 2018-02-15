@@ -20,11 +20,11 @@ import (
 	"testing"
 
 	"github.com/kubernetes-incubator/descheduler/test"
+	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
 	core "k8s.io/client-go/testing"
-	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/clientset/fake"
 )
 
 //TODO:@ravisantoshgudimetla This could be made table driven.
@@ -39,22 +39,22 @@ func TestFindDuplicatePods(t *testing.T) {
 	p7 := test.BuildTestPod("p7", 100, 0, node.Name)
 
 	// All the following pods expect for one will be evicted.
-	p1.Annotations = test.GetReplicaSetAnnotation()
-	p2.Annotations = test.GetReplicaSetAnnotation()
-	p3.Annotations = test.GetReplicaSetAnnotation()
+	p1.ObjectMeta.OwnerReferences = test.GetReplicaSetOwnerRefList()
+	p2.ObjectMeta.OwnerReferences = test.GetReplicaSetOwnerRefList()
+	p3.ObjectMeta.OwnerReferences = test.GetReplicaSetOwnerRefList()
 
 	// The following 4 pods won't get evicted.
 	// A daemonset.
-	p4.Annotations = test.GetDaemonSetAnnotation()
+	p4.ObjectMeta.OwnerReferences = test.GetDaemonSetOwnerRefList()
 	// A pod with local storage.
-	p5.Annotations = test.GetNormalPodAnnotation()
+	p5.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
 	p5.Spec.Volumes = []v1.Volume{
 		{
 			Name: "sample",
 			VolumeSource: v1.VolumeSource{
 				HostPath: &v1.HostPathVolumeSource{Path: "somePath"},
 				EmptyDir: &v1.EmptyDirVolumeSource{
-					SizeLimit: *resource.NewQuantity(int64(10), resource.BinarySI)},
+					SizeLimit: resource.NewQuantity(int64(10), resource.BinarySI)},
 			},
 		},
 	}
@@ -71,7 +71,7 @@ func TestFindDuplicatePods(t *testing.T) {
 	fakeClient.Fake.AddReactor("get", "nodes", func(action core.Action) (bool, runtime.Object, error) {
 		return true, node, nil
 	})
-	podsEvicted := deleteDuplicatePods(fakeClient, "v1", []*v1.Node{node})
+	podsEvicted := deleteDuplicatePods(fakeClient, "v1", []*v1.Node{node}, false)
 	if podsEvicted != expectedEvictedPodCount {
 		t.Errorf("Unexpected no of pods evicted")
 	}

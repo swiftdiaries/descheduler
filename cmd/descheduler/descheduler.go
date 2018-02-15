@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 
@@ -24,7 +25,10 @@ import (
 )
 
 func main() {
-	cmd := app.NewDeschedulerCommand()
+	out := os.Stdout
+	cmd := app.NewDeschedulerCommand(out)
+	cmd.AddCommand(app.NewVersionCommand())
+	flag.CommandLine.Parse([]string{})
 	if err := cmd.Execute(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)

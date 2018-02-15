@@ -17,29 +17,33 @@ limitations under the License.
 package strategies
 
 import (
-	"fmt"
 	"sort"
 
+	"github.com/golang/glog"
+	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/kubernetes/pkg/api/v1"
+	clientset "k8s.io/client-go/kubernetes"
 	helper "k8s.io/kubernetes/pkg/api/v1/resource"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
 
+	"github.com/kubernetes-incubator/descheduler/cmd/descheduler/app/options"
 	"github.com/kubernetes-incubator/descheduler/pkg/api"
 	"github.com/kubernetes-incubator/descheduler/pkg/descheduler/evictions"
+	nodeutil "github.com/kubernetes-incubator/descheduler/pkg/descheduler/node"
 	podutil "github.com/kubernetes-incubator/descheduler/pkg/descheduler/pod"
 )
 
 type NodeUsageMap struct {
 	node             *v1.Node
 	usage            api.ResourceThresholds
-	bePods           []*v1.Pod
+	allPods          []*v1.Pod
 	nonRemovablePods []*v1.Pod
-	otherPods        []*v1.Pod
+	bePods           []*v1.Pod
+	bPods            []*v1.Pod
+	gPods            []*v1.Pod
 }
 type NodePodsMap map[*v1.Node][]*v1.Pod
 
-func LowNodeUtilization(client clientset.Interface, strategy api.DeschedulerStrategy, evictionPolicyGroupVersion string, nodes []*v1.Node) {
+func LowNodeUtilization(ds *options.DeschedulerServer, strategy api.DeschedulerStrategy, evictionPolicyGroupVersion string, nodes []*v1.Node) {
 	if !strategy.Enabled {
 		return
 	}
@@ -55,132 +59,193 @@ func LowNodeUtilization(client clientset.Interface, strategy api.DeschedulerStra
 		return
 	}
 
-	npm := CreateNodePodsMap(client, nodes)
-	lowNodes, targetNodes, _ := classifyNodes(npm, thresholds, targetThresholds)
+	npm := CreateNodePodsMap(ds.Client, nodes)
+	lowNodes, targetNodes := classifyNodes(npm, thresholds, targetThresholds)
+
+	glog.V(1).Infof("Criteria for a node under utilization: CPU: %v, Mem: %v, Pods: %v",
+		thresholds[v1.ResourceCPU], thresholds[v1.ResourceMemory], thresholds[v1.ResourcePods])
 
 	if len(lowNodes) == 0 {
-		fmt.Printf("No node is underutilized\n")
-		return
-	} else if len(lowNodes) < strategy.Params.NodeResourceUtilizationThresholds.NumberOfNodes {
-		fmt.Printf("number of nodes underutilized is less than NumberOfNodes\n")
-		return
-	} else if len(lowNodes) == len(nodes) {
-		fmt.Printf("all nodes are underutilized\n")
-		return
-	} else if len(targetNodes) == 0 {
-		fmt.Printf("no node is above target utilization\n")
+		glog.V(1).Infof("No node is underutilized, nothing to do here, you might tune your thersholds further")
 		return
 	}
-	evictPodsFromTargetNodes(client, evictionPolicyGroupVersion, targetNodes, lowNodes, targetThresholds)
+	glog.V(1).Infof("Total number of underutilized nodes: %v", len(lowNodes))
+
+	if len(lowNodes) < strategy.Params.NodeResourceUtilizationThresholds.NumberOfNodes {
+		glog.V(1).Infof("number of nodes underutilized (%v) is less than NumberOfNodes (%v), nothing to do here", len(lowNodes), strategy.Params.NodeResourceUtilizationThresholds.NumberOfNodes)
+		return
+	}
+
+	if len(lowNodes) == len(nodes) {
+		glog.V(1).Infof("all nodes are underutilized, nothing to do here")
+		return
+	}
+
+	if len(targetNodes) == 0 {
+		glog.V(1).Infof("all nodes are under target utilization, nothing to do here")
+		return
+	}
+
+	glog.V(1).Infof("Criteria for a node above target utilization: CPU: %v, Mem: %v, Pods: %v",
+		targetThresholds[v1.ResourceCPU], targetThresholds[v1.ResourceMemory], targetThresholds[v1.ResourcePods])
+	glog.V(1).Infof("Total number of nodes above target utilization: %v", len(targetNodes))
+
+	totalPodsEvicted := evictPodsFromTargetNodes(ds.Client, evictionPolicyGroupVersion, targetNodes, lowNodes, targetThresholds, ds.DryRun)
+	glog.V(1).Infof("Total number of pods evicted: %v", totalPodsEvicted)
+
 }
 
 func validateThresholds(thresholds api.ResourceThresholds) bool {
-	if thresholds == nil {
-		fmt.Printf("no resource threshold is configured\n")
+	if thresholds == nil || len(thresholds) == 0 {
+		glog.V(1).Infof("no resource threshold is configured")
 		return false
 	}
-	found := false
-	for name, _ := range thresholds {
-		if name == v1.ResourceCPU || name == v1.ResourceMemory || name == v1.ResourcePods {
-			found = true
-			break
+	for name := range thresholds {
+		switch name {
+		case v1.ResourceCPU:
+			continue
+		case v1.ResourceMemory:
+			continue
+		case v1.ResourcePods:
+			continue
+		default:
+			glog.Errorf("only cpu, memory, or pods thresholds can be specified")
+			return false
 		}
 	}
-	if !found {
-		fmt.Printf("one of cpu, memory, or pods resource threshold must be configured\n")
-		return false
-	}
-	return found
+	return true
 }
 
 //This function could be merged into above once we are clear.
 func validateTargetThresholds(targetThresholds api.ResourceThresholds) bool {
 	if targetThresholds == nil {
-		fmt.Printf("no target resource threshold is configured\n")
+		glog.V(1).Infof("no target resource threshold is configured")
 		return false
 	} else if _, ok := targetThresholds[v1.ResourcePods]; !ok {
-		fmt.Printf("no target resource threshold for pods is configured\n")
+		glog.V(1).Infof("no target resource threshold for pods is configured")
 		return false
 	}
 	return true
 }
 
-func classifyNodes(npm NodePodsMap, thresholds api.ResourceThresholds, targetThresholds api.ResourceThresholds) ([]NodeUsageMap, []NodeUsageMap, []NodeUsageMap) {
-	lowNodes, targetNodes, otherNodes := []NodeUsageMap{}, []NodeUsageMap{}, []NodeUsageMap{}
+// classifyNodes classifies the nodes into low-utilization or high-utilization nodes. If a node lies between
+// low and high thresholds, it is simply ignored.
+func classifyNodes(npm NodePodsMap, thresholds api.ResourceThresholds, targetThresholds api.ResourceThresholds) ([]NodeUsageMap, []NodeUsageMap) {
+	lowNodes, targetNodes := []NodeUsageMap{}, []NodeUsageMap{}
 	for node, pods := range npm {
-		usage, bePods, nonRemovablePods, otherPods := NodeUtilization(node, pods)
-		nuMap := NodeUsageMap{node, usage, bePods, nonRemovablePods, otherPods}
-		fmt.Printf("Node %#v usage: %#v\n", node.Name, usage)
-		if IsNodeWithLowUtilization(usage, thresholds) {
+		usage, allPods, nonRemovablePods, bePods, bPods, gPods := NodeUtilization(node, pods)
+		nuMap := NodeUsageMap{node, usage, allPods, nonRemovablePods, bePods, bPods, gPods}
+
+		// Check if node is underutilized and if we can schedule pods on it.
+		if !nodeutil.IsNodeUschedulable(node) && IsNodeWithLowUtilization(usage, thresholds) {
+			glog.V(2).Infof("Node %#v is under utilized with usage: %#v", node.Name, usage)
 			lowNodes = append(lowNodes, nuMap)
 		} else if IsNodeAboveTargetUtilization(usage, targetThresholds) {
+			glog.V(2).Infof("Node %#v is over utilized with usage: %#v", node.Name, usage)
 			targetNodes = append(targetNodes, nuMap)
 		} else {
-			// Seems we don't need to collect them?
-			otherNodes = append(otherNodes, nuMap)
+			glog.V(2).Infof("Node %#v is appropriately utilized with usage: %#v", node.Name, usage)
 		}
+		glog.V(2).Infof("allPods:%v, nonRemovablePods:%v, bePods:%v, bPods:%v, gPods:%v", len(allPods), len(nonRemovablePods), len(bePods), len(bPods), len(gPods))
 	}
-	return lowNodes, targetNodes, otherNodes
+	return lowNodes, targetNodes
 }
 
-func evictPodsFromTargetNodes(client clientset.Interface, evictionPolicyGroupVersion string, targetNodes []NodeUsageMap, lowNodes []NodeUsageMap, targetThresholds api.ResourceThresholds) int {
+func evictPodsFromTargetNodes(client clientset.Interface, evictionPolicyGroupVersion string, targetNodes, lowNodes []NodeUsageMap, targetThresholds api.ResourceThresholds, dryRun bool) int {
 	podsEvicted := 0
 
 	SortNodesByUsage(targetNodes)
 
-	// total number of pods to be moved
-	var totalPods float64
+	// upper bound on total number of pods/cpu/memory to be moved
+	var totalPods, totalCpu, totalMem float64
 	for _, node := range lowNodes {
-		podsPercentage := targetThresholds[v1.ResourcePods] - node.usage[v1.ResourcePods]
-		nodeCapcity := node.node.Status.Capacity
+		nodeCapacity := node.node.Status.Capacity
 		if len(node.node.Status.Allocatable) > 0 {
-			nodeCapcity = node.node.Status.Allocatable
+			nodeCapacity = node.node.Status.Allocatable
 		}
-		totalPods += ((float64(podsPercentage) * float64(nodeCapcity.Pods().Value())) / 100)
+		// totalPods to be moved
+		podsPercentage := targetThresholds[v1.ResourcePods] - node.usage[v1.ResourcePods]
+		totalPods += ((float64(podsPercentage) * float64(nodeCapacity.Pods().Value())) / 100)
+
+		// totalCPU capacity to be moved
+		if _, ok := targetThresholds[v1.ResourceCPU]; ok {
+			cpuPercentage := targetThresholds[v1.ResourceCPU] - node.usage[v1.ResourceCPU]
+			totalCpu += ((float64(cpuPercentage) * float64(nodeCapacity.Cpu().MilliValue())) / 100)
+		}
+
+		// totalMem capacity to be moved
+		if _, ok := targetThresholds[v1.ResourceMemory]; ok {
+			memPercentage := targetThresholds[v1.ResourceMemory] - node.usage[v1.ResourceMemory]
+			totalMem += ((float64(memPercentage) * float64(nodeCapacity.Memory().Value())) / 100)
+		}
 	}
+
+	glog.V(1).Infof("Total capacity to be moved: CPU:%v, Mem:%v, Pods:%v", totalCpu, totalMem, totalPods)
+	glog.V(1).Infof("********Number of pods evicted from each node:***********")
 
 	for _, node := range targetNodes {
-		nodePodsUsage := node.usage[v1.ResourcePods]
-
-		nodeCapcity := node.node.Status.Capacity
+		nodeCapacity := node.node.Status.Capacity
 		if len(node.node.Status.Allocatable) > 0 {
-			nodeCapcity = node.node.Status.Allocatable
+			nodeCapacity = node.node.Status.Allocatable
 		}
-		onePodPercentage := api.Percentage((float64(1) * 100) / float64(nodeCapcity.Pods().Value()))
-		if nodePodsUsage > targetThresholds[v1.ResourcePods] && totalPods > 0 {
-			for _, pod := range node.bePods {
-				success, err := evictions.EvictPod(client, pod, evictionPolicyGroupVersion)
-				if !success {
-					fmt.Printf("Error when evicting pod: %#v (%#v)\n", pod.Name, err)
-				} else {
-					fmt.Printf("Evicted pod: %#v (%#v)\n", pod.Name, err)
-					nodePodsUsage = nodePodsUsage - onePodPercentage
-					totalPods--
-					if nodePodsUsage <= targetThresholds[v1.ResourcePods] || totalPods <= 0 {
-						break
-					}
+		glog.V(3).Infof("evicting pods from node %#v with usage: %#v", node.node.Name, node.usage)
+		currentPodsEvicted := podsEvicted
 
-				}
-			}
-			if nodePodsUsage > targetThresholds[v1.ResourcePods] && totalPods > 0 {
-				for _, pod := range node.otherPods {
-					success, err := evictions.EvictPod(client, pod, evictionPolicyGroupVersion)
-					if !success {
-						fmt.Printf("Error when evicting pod: %#v (%#v)\n", pod.Name, err)
-					} else {
-						fmt.Printf("Evicted pod: %#v (%#v)\n", pod.Name, err)
-						podsEvicted++
-						nodePodsUsage = nodePodsUsage - onePodPercentage
-						totalPods--
-						if nodePodsUsage <= targetThresholds[v1.ResourcePods] || totalPods <= 0 {
-							break
-						}
-					}
+		// evict best effort pods
+		evictPods(node.bePods, client, evictionPolicyGroupVersion, targetThresholds, nodeCapacity, node.usage, &totalPods, &totalCpu, &totalMem, &podsEvicted, dryRun)
+		// evict burstable pods
+		evictPods(node.bPods, client, evictionPolicyGroupVersion, targetThresholds, nodeCapacity, node.usage, &totalPods, &totalCpu, &totalMem, &podsEvicted, dryRun)
+		// evict guaranteed pods
+		evictPods(node.gPods, client, evictionPolicyGroupVersion, targetThresholds, nodeCapacity, node.usage, &totalPods, &totalCpu, &totalMem, &podsEvicted, dryRun)
+
+		podsEvictedFromNode := podsEvicted - currentPodsEvicted
+		glog.V(1).Infof("%v pods evicted from node %#v with usage %v", podsEvictedFromNode, node.node.Name, node.usage)
+	}
+	return podsEvicted
+}
+
+func evictPods(inputPods []*v1.Pod,
+	client clientset.Interface,
+	evictionPolicyGroupVersion string,
+	targetThresholds api.ResourceThresholds,
+	nodeCapacity v1.ResourceList,
+	nodeUsage api.ResourceThresholds,
+	totalPods *float64,
+	totalCpu *float64,
+	totalMem *float64,
+	podsEvicted *int,
+	dryRun bool) {
+	if IsNodeAboveTargetUtilization(nodeUsage, targetThresholds) && (*totalPods > 0 || *totalCpu > 0 || *totalMem > 0) {
+		onePodPercentage := api.Percentage((float64(1) * 100) / float64(nodeCapacity.Pods().Value()))
+		for _, pod := range inputPods {
+			cUsage := helper.GetResourceRequest(pod, v1.ResourceCPU)
+			mUsage := helper.GetResourceRequest(pod, v1.ResourceMemory)
+			success, err := evictions.EvictPod(client, pod, evictionPolicyGroupVersion, dryRun)
+			if !success {
+				glog.Warningf("Error when evicting pod: %#v (%#v)", pod.Name, err)
+			} else {
+				glog.V(3).Infof("Evicted pod: %#v (%#v)", pod.Name, err)
+				// update remaining pods
+				*podsEvicted++
+				nodeUsage[v1.ResourcePods] -= onePodPercentage
+				*totalPods--
+
+				// update remaining cpu
+				*totalCpu -= float64(cUsage)
+				nodeUsage[v1.ResourceCPU] -= api.Percentage((float64(cUsage) * 100) / float64(nodeCapacity.Cpu().MilliValue()))
+
+				// update remaining memory
+				*totalMem -= float64(mUsage)
+				nodeUsage[v1.ResourceMemory] -= api.Percentage(float64(mUsage) / float64(nodeCapacity.Memory().Value()) * 100)
+
+				glog.V(3).Infof("updated node usage: %#v", nodeUsage)
+				// check if node utilization drops below target threshold or required capacity (cpu, memory, pods) is moved
+				if !IsNodeAboveTargetUtilization(nodeUsage, targetThresholds) || (*totalPods <= 0 && *totalCpu <= 0 && *totalMem <= 0) {
+					break
 				}
 			}
 		}
 	}
-	return podsEvicted
 }
 
 func SortNodesByUsage(nodes []NodeUsageMap) {
@@ -206,7 +271,7 @@ func CreateNodePodsMap(client clientset.Interface, nodes []*v1.Node) NodePodsMap
 	for _, node := range nodes {
 		pods, err := podutil.ListPodsOnANode(client, node)
 		if err != nil {
-			fmt.Printf("node %s will not be processed, error in accessing its pods (%#v)\n", node.Name, err)
+			glog.Warningf("node %s will not be processed, error in accessing its pods (%#v)", node.Name, err)
 		} else {
 			npm[node] = pods
 		}
@@ -240,18 +305,15 @@ func IsNodeWithLowUtilization(nodeThresholds api.ResourceThresholds, thresholds 
 	return true
 }
 
-func NodeUtilization(node *v1.Node, pods []*v1.Pod) (api.ResourceThresholds, []*v1.Pod, []*v1.Pod, []*v1.Pod) {
+func NodeUtilization(node *v1.Node, pods []*v1.Pod) (api.ResourceThresholds, []*v1.Pod, []*v1.Pod, []*v1.Pod, []*v1.Pod, []*v1.Pod) {
 	bePods := []*v1.Pod{}
 	nonRemovablePods := []*v1.Pod{}
-	otherPods := []*v1.Pod{}
+	bPods := []*v1.Pod{}
+	gPods := []*v1.Pod{}
 	totalReqs := map[v1.ResourceName]resource.Quantity{}
 	for _, pod := range pods {
-		sr, err := podutil.CreatorRef(pod)
-		if err != nil {
-			sr = nil
-		}
-
-		if podutil.IsMirrorPod(pod) || podutil.IsPodWithLocalStorage(pod) || sr == nil || podutil.IsDaemonsetPod(sr) || podutil.IsCriticalPod(pod) {
+		// We need to compute the usage of nonRemovablePods unless it is a best effort pod. So, cannot use podutil.ListEvictablePodsOnNode
+		if !podutil.IsEvictable(pod) {
 			nonRemovablePods = append(nonRemovablePods, pod)
 			if podutil.IsBestEffortPod(pod) {
 				continue
@@ -259,16 +321,13 @@ func NodeUtilization(node *v1.Node, pods []*v1.Pod) (api.ResourceThresholds, []*
 		} else if podutil.IsBestEffortPod(pod) {
 			bePods = append(bePods, pod)
 			continue
+		} else if podutil.IsBurstablePod(pod) {
+			bPods = append(bPods, pod)
 		} else {
-			// todo: differentiate between burstable and guranteed pods
-			otherPods = append(otherPods, pod)
+			gPods = append(gPods, pod)
 		}
 
-		req, _, err := helper.PodRequestsAndLimits(pod)
-		if err != nil {
-			fmt.Printf("Error computing resource usage of pod, ignoring: %#v\n", pod.Name)
-			continue
-		}
+		req, _ := helper.PodRequestsAndLimits(pod)
 		for name, quantity := range req {
 			if name == v1.ResourceCPU || name == v1.ResourceMemory {
 				if value, ok := totalReqs[name]; !ok {
@@ -281,17 +340,17 @@ func NodeUtilization(node *v1.Node, pods []*v1.Pod) (api.ResourceThresholds, []*
 		}
 	}
 
-	nodeCapcity := node.Status.Capacity
+	nodeCapacity := node.Status.Capacity
 	if len(node.Status.Allocatable) > 0 {
-		nodeCapcity = node.Status.Allocatable
+		nodeCapacity = node.Status.Allocatable
 	}
 
 	usage := api.ResourceThresholds{}
 	totalCPUReq := totalReqs[v1.ResourceCPU]
 	totalMemReq := totalReqs[v1.ResourceMemory]
 	totalPods := len(pods)
-	usage[v1.ResourceCPU] = api.Percentage((float64(totalCPUReq.MilliValue()) * 100) / float64(nodeCapcity.Cpu().MilliValue()))
-	usage[v1.ResourceMemory] = api.Percentage(float64(totalMemReq.Value()) / float64(nodeCapcity.Memory().Value()) * 100)
-	usage[v1.ResourcePods] = api.Percentage((float64(totalPods) * 100) / float64(nodeCapcity.Pods().Value()))
-	return usage, bePods, nonRemovablePods, otherPods
+	usage[v1.ResourceCPU] = api.Percentage((float64(totalCPUReq.MilliValue()) * 100) / float64(nodeCapacity.Cpu().MilliValue()))
+	usage[v1.ResourceMemory] = api.Percentage(float64(totalMemReq.Value()) / float64(nodeCapacity.Memory().Value()) * 100)
+	usage[v1.ResourcePods] = api.Percentage((float64(totalPods) * 100) / float64(nodeCapacity.Pods().Value()))
+	return usage, pods, nonRemovablePods, bePods, bPods, gPods
 }

@@ -17,35 +17,48 @@ limitations under the License.
 package node
 
 import (
-	"fmt"
 	"time"
 
+	"github.com/golang/glog"
+	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
+	clientset "k8s.io/client-go/kubernetes"
+	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
-	corelisters "k8s.io/kubernetes/pkg/client/listers/core/v1"
 )
 
 // ReadyNodes returns ready nodes irrespective of whether they are
 // schedulable or not.
-func ReadyNodes(client clientset.Interface, stopChannel <-chan struct{}) ([]*v1.Node, error) {
-	nl := GetNodeLister(client, stopChannel)
-	nodes, err := nl.List(labels.Everything())
+func ReadyNodes(client clientset.Interface, nodeSelector string, stopChannel <-chan struct{}) ([]*v1.Node, error) {
+	ns, err := labels.Parse(nodeSelector)
 	if err != nil {
 		return []*v1.Node{}, err
 	}
 
+	var nodes []*v1.Node
+	nl := GetNodeLister(client, stopChannel)
+	if nl != nil {
+		// err is defined above
+		if nodes, err = nl.List(ns); err != nil {
+			return []*v1.Node{}, err
+		}
+	}
+
 	if len(nodes) == 0 {
-		var err error
-		nItems, err := client.Core().Nodes().List(metav1.ListOptions{})
+		glog.V(2).Infof("node lister returned empty list, now fetch directly")
+
+		nItems, err := client.Core().Nodes().List(metav1.ListOptions{LabelSelector: nodeSelector})
 		if err != nil {
 			return []*v1.Node{}, err
 		}
 
-		for i, _ := range nItems.Items {
+		if nItems == nil || len(nItems.Items) == 0 {
+			return []*v1.Node{}, nil
+		}
+
+		for i := range nItems.Items {
 			node := nItems.Items[i]
 			nodes = append(nodes, &node)
 		}
@@ -61,15 +74,22 @@ func ReadyNodes(client clientset.Interface, stopChannel <-chan struct{}) ([]*v1.
 }
 
 func GetNodeLister(client clientset.Interface, stopChannel <-chan struct{}) corelisters.NodeLister {
+	if stopChannel == nil {
+		return nil
+	}
 	listWatcher := cache.NewListWatchFromClient(client.Core().RESTClient(), "nodes", v1.NamespaceAll, fields.Everything())
 	store := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
 	nodeLister := corelisters.NewNodeLister(store)
 	reflector := cache.NewReflector(listWatcher, &v1.Node{}, store, time.Hour)
-	reflector.RunUntil(stopChannel)
+	go reflector.Run(stopChannel)
+
+	// To give some time so that listing works, chosen randomly
+	time.Sleep(100 * time.Millisecond)
 
 	return nodeLister
 }
 
+// IsReady checks if the descheduler could run against given node.
 func IsReady(node *v1.Node) bool {
 	for i := range node.Status.Conditions {
 		cond := &node.Status.Conditions[i]
@@ -78,7 +98,7 @@ func IsReady(node *v1.Node) bool {
 		// - NodeOutOfDisk condition status is ConditionFalse,
 		// - NodeNetworkUnavailable condition status is ConditionFalse.
 		if cond.Type == v1.NodeReady && cond.Status != v1.ConditionTrue {
-			fmt.Printf("Ignoring node %v with %v condition status %v", node.Name, cond.Type, cond.Status)
+			glog.V(1).Infof("Ignoring node %v with %v condition status %v", node.Name, cond.Type, cond.Status)
 			return false
 		} /*else if cond.Type == v1.NodeOutOfDisk && cond.Status != v1.ConditionFalse {
 			glog.V(4).Infof("Ignoring node %v with %v condition status %v", node.Name, cond.Type, cond.Status)
@@ -94,4 +114,13 @@ func IsReady(node *v1.Node) bool {
 		return false
 	}*/
 	return true
+}
+
+// IsNodeUschedulable checks if the node is unschedulable. This is helper function to check only in case of
+// underutilized node so that they won't be accounted for.
+func IsNodeUschedulable(node *v1.Node) bool {
+	if node.Spec.Unschedulable {
+		return true
+	}
+	return false
 }

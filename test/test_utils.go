@@ -16,16 +16,15 @@ limitations under the License.
 
 package test
 
-import ("fmt"
+import (
+	"fmt"
 
+	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/kubernetes/pkg/api/v1"
 )
 
-// TODO:@ravisantoshgudimetla. As of now building some test pods here. This needs to
-// move to utils after refactor.
-// buildTestPod creates a test pod with given parameters.
+// BuildTestPod creates a test pod with given parameters.
 func BuildTestPod(name string, cpu int64, memory int64, nodeName string) *v1.Pod {
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -63,25 +62,25 @@ func GetMirrorPodAnnotation() map[string]string {
 	}
 }
 
-// GetNormalPodAnnotation returns the annotation needed for a pod.
-func GetNormalPodAnnotation() map[string]string {
-	return map[string]string{
-		"kubernetes.io/created-by": "{\"kind\":\"SerializedReference\",\"apiVersion\":\"v1\",\"reference\":{\"kind\":\"Pod\"}}",
-	}
+// GetNormalPodOwnerRefList returns the ownerRef needed for a pod.
+func GetNormalPodOwnerRefList() []metav1.OwnerReference {
+	ownerRefList := make([]metav1.OwnerReference, 0)
+	ownerRefList = append(ownerRefList, metav1.OwnerReference{Kind: "Pod", APIVersion: "v1"})
+	return ownerRefList
 }
 
-// GetReplicaSetAnnotation returns the annotation needed for replicaset pod.
-func GetReplicaSetAnnotation() map[string]string {
-	return map[string]string{
-		"kubernetes.io/created-by": "{\"kind\":\"SerializedReference\",\"apiVersion\":\"v1\",\"reference\":{\"kind\":\"ReplicaSet\"}}",
-	}
+// GetReplicaSetOwnerRefList returns the ownerRef needed for replicaset pod.
+func GetReplicaSetOwnerRefList() []metav1.OwnerReference {
+	ownerRefList := make([]metav1.OwnerReference, 0)
+	ownerRefList = append(ownerRefList, metav1.OwnerReference{Kind: "ReplicaSet", APIVersion: "v1"})
+	return ownerRefList
 }
 
-// GetDaemonSetAnnotation returns the annotation needed for daemonset pod.
-func GetDaemonSetAnnotation() map[string]string {
-	return map[string]string{
-		"kubernetes.io/created-by": "{\"kind\":\"SerializedReference\",\"apiVersion\":\"v1\",\"reference\":{\"kind\":\"DaemonSet\"}}",
-	}
+// GetDaemonSetOwnerRefList returns the ownerRef needed for daemonset pod.
+func GetDaemonSetOwnerRefList() []metav1.OwnerReference {
+	ownerRefList := make([]metav1.OwnerReference, 0)
+	ownerRefList = append(ownerRefList, metav1.OwnerReference{Kind: "DaemonSet", APIVersion: "v1"})
+	return ownerRefList
 }
 
 // GetCriticalPodAnnotation returns the annotation needed for critical pod.
@@ -91,7 +90,6 @@ func GetCriticalPodAnnotation() map[string]string {
 		"scheduler.alpha.kubernetes.io/critical-pod": "",
 	}
 }
-
 
 // BuildTestNode creates a node with specified capacity.
 func BuildTestNode(name string, millicpu int64, mem int64, pods int64) *v1.Node {

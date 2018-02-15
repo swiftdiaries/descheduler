@@ -18,10 +18,10 @@ package evictions
 
 import (
 	"github.com/kubernetes-incubator/descheduler/test"
+	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
 	core "k8s.io/client-go/testing"
-	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/clientset/fake"
 	"testing"
 )
 
@@ -32,7 +32,7 @@ func TestEvictPod(t *testing.T) {
 	fakeClient.Fake.AddReactor("list", "pods", func(action core.Action) (bool, runtime.Object, error) {
 		return true, &v1.PodList{Items: []v1.Pod{*p1}}, nil
 	})
-	evicted, _ := EvictPod(fakeClient, p1, "v1")
+	evicted, _ := EvictPod(fakeClient, p1, "v1", false)
 	if !evicted {
 		t.Errorf("Expected %v pod to be evicted", p1.Name)
 	}

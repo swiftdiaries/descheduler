@@ -18,32 +18,41 @@ limitations under the License.
 package app
 
 import (
-	"fmt"
+	"flag"
+	"io"
 
 	"github.com/kubernetes-incubator/descheduler/cmd/descheduler/app/options"
 	"github.com/kubernetes-incubator/descheduler/pkg/descheduler"
 
+	"github.com/golang/glog"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
+
+	aflag "k8s.io/apiserver/pkg/util/flag"
+	"k8s.io/apiserver/pkg/util/logs"
 )
 
 // NewDeschedulerCommand creates a *cobra.Command object with default parameters
-func NewDeschedulerCommand() *cobra.Command {
+func NewDeschedulerCommand(out io.Writer) *cobra.Command {
 	s := options.NewDeschedulerServer()
-	s.AddFlags(pflag.CommandLine)
 	cmd := &cobra.Command{
 		Use:   "descheduler",
 		Short: "descheduler",
 		Long:  `The descheduler evicts pods which may be bound to less desired nodes`,
 		Run: func(cmd *cobra.Command, args []string) {
+			logs.InitLogs()
+			defer logs.FlushLogs()
 			err := Run(s)
 			if err != nil {
-				fmt.Println(err)
+				glog.Errorf("%v", err)
 			}
-
 		},
 	}
+	cmd.SetOutput(out)
 
+	flags := cmd.Flags()
+	flags.SetNormalizeFunc(aflag.WordSepNormalizeFunc)
+	flags.AddGoFlagSet(flag.CommandLine)
+	s.AddFlags(flags)
 	return cmd
 }
 

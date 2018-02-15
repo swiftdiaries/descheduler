@@ -17,19 +17,74 @@ limitations under the License.
 package pod
 
 import (
+	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/api/v1/helper/qos"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
+	clientset "k8s.io/client-go/kubernetes"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/apis/core/v1/helper/qos"
 	"k8s.io/kubernetes/pkg/kubelet/types"
 )
 
+// checkLatencySensitiveResourcesForAContainer checks if there are any latency sensitive resources like GPUs.
+func checkLatencySensitiveResourcesForAContainer(rl v1.ResourceList) bool {
+	if rl == nil {
+		return false
+	}
+	for rName := range rl {
+		if rName == v1.ResourceNvidiaGPU {
+			return true
+		}
+		// TODO: Add support for other high value resources like hugepages etc. once kube is rebased to 1.8.
+	}
+	return false
+}
+
+// IsLatencySensitivePod checks if a pod consumes high value devices like GPUs, hugepages or when cpu pinning enabled.
+func IsLatencySensitivePod(pod *v1.Pod) bool {
+	for _, container := range pod.Spec.Containers {
+		resourceList := container.Resources.Requests
+		if checkLatencySensitiveResourcesForAContainer(resourceList) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsEvictable checks if a pod is evictable or not.
+func IsEvictable(pod *v1.Pod) bool {
+	ownerRefList := OwnerRef(pod)
+	if IsMirrorPod(pod) || IsPodWithLocalStorage(pod) || len(ownerRefList) == 0 || IsDaemonsetPod(ownerRefList) || IsCriticalPod(pod) {
+		return false
+	}
+	return true
+}
+
+// ListEvictablePodsOnNode returns the list of evictable pods on node.
+func ListEvictablePodsOnNode(client clientset.Interface, node *v1.Node) ([]*v1.Pod, error) {
+	pods, err := ListPodsOnANode(client, node)
+	if err != nil {
+		return []*v1.Pod{}, err
+	}
+	evictablePods := make([]*v1.Pod, 0)
+	for _, pod := range pods {
+		if !IsEvictable(pod) {
+			continue
+		} else {
+			evictablePods = append(evictablePods, pod)
+		}
+	}
+	return evictablePods, nil
+}
+
 func ListPodsOnANode(client clientset.Interface, node *v1.Node) ([]*v1.Pod, error) {
+	fieldSelector, err := fields.ParseSelector("spec.nodeName=" + node.Name + ",status.phase!=" + string(api.PodSucceeded) + ",status.phase!=" + string(api.PodFailed))
+	if err != nil {
+		return []*v1.Pod{}, err
+	}
+
 	podList, err := client.CoreV1().Pods(v1.NamespaceAll).List(
-		metav1.ListOptions{FieldSelector: fields.SelectorFromSet(fields.Set{"spec.nodeName": node.Name}).String()})
+		metav1.ListOptions{FieldSelector: fieldSelector.String()})
 	if err != nil {
 		return []*v1.Pod{}, err
 	}
@@ -38,7 +93,6 @@ func ListPodsOnANode(client clientset.Interface, node *v1.Node) ([]*v1.Pod, erro
 	for i := range podList.Items {
 		pods = append(pods, &podList.Items[i])
 	}
-
 	return pods, nil
 }
 
@@ -58,9 +112,11 @@ func IsGuaranteedPod(pod *v1.Pod) bool {
 	return qos.GetPodQOS(pod) == v1.PodQOSGuaranteed
 }
 
-func IsDaemonsetPod(sr *v1.SerializedReference) bool {
-	if sr != nil {
-		return sr.Reference.Kind == "DaemonSet"
+func IsDaemonsetPod(ownerRefList []metav1.OwnerReference) bool {
+	for _, ownerRef := range ownerRefList {
+		if ownerRef.Kind == "DaemonSet" {
+			return true
+		}
 	}
 	return false
 }
@@ -81,15 +137,7 @@ func IsPodWithLocalStorage(pod *v1.Pod) bool {
 	return false
 }
 
-// CreatorRef returns the kind of the creator reference of the pod.
-func CreatorRef(pod *v1.Pod) (*v1.SerializedReference, error) {
-	creatorRef, found := pod.ObjectMeta.Annotations[v1.CreatedByAnnotation]
-	if !found {
-		return nil, nil
-	}
-	var sr v1.SerializedReference
-	if err := runtime.DecodeInto(api.Codecs.UniversalDecoder(), []byte(creatorRef), &sr); err != nil {
-		return nil, err
-	}
-	return &sr, nil
+// OwnerRef returns the ownerRefList for the pod.
+func OwnerRef(pod *v1.Pod) []metav1.OwnerReference {
+	return pod.ObjectMeta.GetOwnerReferences()
 }

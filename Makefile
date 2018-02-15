@@ -12,13 +12,31 @@
 # # See the License for the specific language governing permissions and
 # # limitations under the License.
 
+.PHONY: test
+
+# VERSION is currently based on the last commit
+VERSION=`git describe --tags`
+COMMIT=`git rev-parse HEAD`
+BUILD=`date +%FT%T%z`
+LDFLAG_LOCATION=github.com/kubernetes-incubator/descheduler/cmd/descheduler/app
+
+LDFLAGS=-ldflags "-X ${LDFLAG_LOCATION}.version=${VERSION} -X ${LDFLAG_LOCATION}.buildDate=${BUILD} -X ${LDFLAG_LOCATION}.gitCommit=${COMMIT}"
+
+
+# IMAGE is the image name of descheduler
+# Should this be changed?
+IMAGE:=descheduler:$(VERSION)
+
+all: build
 
 build:
-	go build -o _output/bin/descheduler github.com/kubernetes-incubator/descheduler/cmd/descheduler
+	go build ${LDFLAGS} -o _output/bin/descheduler github.com/kubernetes-incubator/descheduler/cmd/descheduler 
+
+image: build
+	docker build -t $(IMAGE) .
 
 clean:
 	rm -rf _output
 
-.PHONY: test
 test:
 	./test/run-unit-tests.sh

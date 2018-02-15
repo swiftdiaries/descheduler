@@ -22,6 +22,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
 type DeschedulerConfiguration struct {
 	metav1.TypeMeta
 
@@ -34,4 +36,10 @@ type DeschedulerConfiguration struct {
 
 	// PolicyConfigFile is the filepath to the descheduler policy configuration.
 	PolicyConfigFile string
+
+	// Dry run
+	DryRun bool
+
+	// Node selectors
+	NodeSelector string
 }
